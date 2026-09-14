@@ -1,0 +1,11 @@
+[package]
+name = "compositionfuqs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+unicode-segmentation = "1.13.3"
+
+[[bin]]
+name = "compfuqs"
+path = "src/main.rs"

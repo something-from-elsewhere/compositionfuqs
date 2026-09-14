@@ -1,0 +1,9 @@
+#!also your
+
+fu main() {
+  i = 5+7
+  i = "some stuff+things!\"\\"
+  i = 7.84+ 5.93 - 3.14
+  your::other()
+  i =>
+}
