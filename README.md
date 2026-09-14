@@ -8,5 +8,7 @@ make sure you have rust + cargo, and then `cargo build`. easy. rust makes things
 ## Why make this
 at first because i wanted a unique programming language for my upcoming video game composite->knowledge, but this eventually became its own project. now i make it because i think the idea of an esolang
 that doesn't suck to program in is pretty cool actually.
+## But do it work tho?
+the current stage of the project is merely a multithreaded linter, and it works if that's how you define function. but if you want it to turn syntax into executable code, you'll have to wait some
 ## Okay but have you considered—
 yes, no, maybe so. email me about it if you're so inclined.
