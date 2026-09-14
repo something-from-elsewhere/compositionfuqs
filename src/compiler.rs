@@ -16,7 +16,7 @@ use crate::{
 
 #[derive(Debug)]
 pub struct Compiler {
-    modules: Arc<RwLock<Vec<(PathBuf, Part)>>>,
+    pub(crate) parts: Arc<RwLock<Vec<(PathBuf, Part)>>>,
     errors: Vec<CompilerError>,
 }
 
@@ -43,7 +43,7 @@ pub struct PartCorruptedError {
 impl Compiler {
     pub fn new() -> Self {
         Self {
-            modules: Arc::new(RwLock::new(Vec::new())),
+            parts: Arc::new(RwLock::new(Vec::new())),
             errors: Vec::new(),
         }
     }
@@ -59,7 +59,11 @@ impl Compiler {
             root_file
         };
         let name = root_file.to_str().unwrap_or("").replace(['\\', '/'], "::");
-        let mut modules = self.modules.write().unwrap();
+        let name = match name.strip_suffix(".cfuq") {
+            Some(val) => val.to_string(),
+            None => name,
+        };
+        let mut modules = self.parts.write().unwrap();
         modules.push((
             root_file.with_extension(""),
             Part::new(File::open(root_file.with_extension("cfuq"))?, name),
@@ -67,7 +71,7 @@ impl Compiler {
         drop(modules);
         let job_queue = Arc::new(Mutex::new(vec![0]));
 
-        let ctx = LexContext::new(self.modules.clone(), job_queue.clone());
+        let ctx = LexContext::new(self.parts.clone(), job_queue.clone());
         let mut scheduler = Scheduler::<Lexer>::new(&mut self.errors, threads, job_queue, ctx);
         scheduler.run();
         // let mut idx = 0;
@@ -163,7 +167,7 @@ impl From<SchedulerError> for CompilerError {
 impl Display for CompilerErrorDisplay<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(prov) = self.provenance() {
-            let module = &self.compiler.modules.read().unwrap()[prov.file_id()];
+            let module = &self.compiler.parts.read().unwrap()[prov.file_id()];
             write!(
                 f,
                 "{}:{}:{}: {}",

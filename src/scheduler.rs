@@ -34,6 +34,7 @@ pub(crate) trait Stage
 where
     Self: Sized,
     Self: 'static,
+    Self: Send,
 {
     type Result: Send + 'static;
     type Job: Send + 'static;
@@ -41,11 +42,13 @@ where
     type Response: Send + 'static;
     type Context: Send + 'static;
 
-    fn spin_up(
+    fn new(
         id: usize,
         rx: Receiver<SchedulerResponse<Self>>,
         tx: Sender<(usize, WorkerRequest<Self>)>,
-    ) -> Result<(), SchedulerError>;
+    ) -> Self;
+
+    fn spin_up(self) -> Result<(), SchedulerError>;
 
     fn handle_request(rq: Self::Request, ctx: &mut Self::Context) -> Self::Response;
 
@@ -141,7 +144,7 @@ impl<'a, S: Stage> Scheduler<'a, S> {
             let producer = producer.clone();
             workers.push(Worker {
                 state: WorkerState::Idle,
-                handle: thread::spawn(move || S::spin_up(idx, rx, producer)),
+                handle: thread::spawn(move || S::new().spin_up(idx, rx, producer)),
                 tx,
             });
         }
@@ -226,6 +229,7 @@ impl<'a, S: Stage> Scheduler<'a, S> {
                                 .into(),
                             );
                         } else {
+                            worker.state = WorkerState::Running;
                             all_workers_idle = false;
                         }
                     }
@@ -238,7 +242,7 @@ impl<'a, S: Stage> Scheduler<'a, S> {
                         worker,
                         Worker {
                             state: WorkerState::Idle,
-                            handle: thread::spawn(move || S::spin_up(i, rx, producer)),
+                            handle: thread::spawn(move || S::new().spin_up(i, rx, producer)),
                             tx,
                         },
                     );

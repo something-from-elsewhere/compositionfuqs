@@ -5,12 +5,14 @@ use crate::scheduler::{
 };
 use crate::tokens::TokenKind::{self, Delim, Keyword, Literal, MacroInv, Operator};
 use crate::tokens::{self, DelimKind, Token, TokenKind::Directive};
-use crate::tokens::{DELIMS, DIRECTIVES, KEYWORDS, LiteralKind, OPS, OperatorKind, SINGLE_OPS};
+use crate::tokens::{
+    DELIMS, DIRECTIVES, KEYWORDS, LiteralKind, MULTI_DELIMS, MULTI_OPS, OPS, OperatorKind,
+};
 use std::error::Error;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::{fmt, mem};
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -28,11 +30,24 @@ pub struct LexResult {
 }
 
 pub(crate) struct LexContext {
-    modules: Arc<RwLock<Vec<(PathBuf, Part)>>>,
+    parts_list: Arc<RwLock<Vec<(PathBuf, Part)>>>,
     job_queue: Arc<Mutex<Vec<usize>>>,
 }
 
-pub struct Lexer;
+pub(crate) struct Lexer {
+    worker_id: usize,
+    file_id: usize,
+    outstanding_module_requests: usize,
+    tokens: Vec<Token>,
+    const_macros: Vec<ConstMacro>,
+    macro_funcs: Vec<MacroFunc>,
+    errors: Vec<LexError>,
+    pos: Position,
+    rd: Option<BufReader<File>>,
+    file: Option<File>,
+    rx: Receiver<SchedulerResponse<Lexer>>,
+    tx: Sender<(usize, WorkerRequest<Lexer>)>,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct Position {
@@ -50,10 +65,13 @@ pub(crate) struct ModIdRequest {
 
 impl LexContext {
     pub(crate) fn new(
-        modules: Arc<RwLock<Vec<(PathBuf, Part)>>>,
+        parts_list: Arc<RwLock<Vec<(PathBuf, Part)>>>,
         job_queue: Arc<Mutex<Vec<usize>>>,
     ) -> Self {
-        Self { modules, job_queue }
+        Self {
+            parts_list,
+            job_queue,
+        }
     }
 }
 
@@ -64,12 +82,29 @@ impl Stage for Lexer {
     type Response = Result<usize, BadIncludeError>;
     type Context = LexContext;
 
-    fn spin_up(
+    fn new(
         id: usize,
         rx: Receiver<SchedulerResponse<Self>>,
         tx: Sender<(usize, WorkerRequest<Self>)>,
-    ) -> Result<(), SchedulerError> {
-        let (mut file_id, mut file) = match rx.recv()? {
+    ) -> Self {
+        Self {
+            worker_id: id,
+            file_id: 0,
+            outstanding_module_requests: 0,
+            tokens: Vec::new(),
+            const_macros: Vec::new(),
+            macro_funcs: Vec::new(),
+            errors: Vec::new(),
+            pos: Position::new(0),
+            rd: None,
+            file: None,
+            rx,
+            tx,
+        }
+    }
+
+    fn spin_up(mut self) -> Result<(), SchedulerError> {
+        let (mut file_id, mut file) = match self.rx.recv()? {
             SchedulerResponse::NewJob(file_id, file) => (file_id, file),
             SchedulerResponse::Respond(_) => {
                 return Err(LexError::from(BadResponseError).into());
@@ -78,11 +113,10 @@ impl Stage for Lexer {
         };
 
         loop {
-            let (mut outstanding_module_requests, result) = Lexer::lex_file(id, file_id, file, &tx);
-            let mut result = result?;
+            let mut result = self.lex_file(file_id, file)?;
 
-            while outstanding_module_requests > 0 {
-                match rx.recv().unwrap() {
+            while self.outstanding_module_requests > 0 {
+                match self.rx.recv().unwrap() {
                     SchedulerResponse::NewJob(_, _) => {
                         return Err(LexError::from(BadResponseError).into());
                     }
@@ -91,17 +125,23 @@ impl Stage for Lexer {
                             Ok(val) => result.modules.push(val),
                             Err(err) => result.errors.push(err.into()),
                         }
-                        outstanding_module_requests -= 1;
+                        self.outstanding_module_requests -= 1;
                     }
                     SchedulerResponse::ShutDown => return Ok(()),
                 }
             }
 
-            if tx.send((id, WorkerRequest::NewJob(result))).is_err() {
-                return Err(LexError::from(FailedRequestError::new(id, "New Job")).into());
+            if self
+                .tx
+                .send((self.worker_id, WorkerRequest::NewJob(result)))
+                .is_err()
+            {
+                return Err(
+                    LexError::from(FailedRequestError::new(self.worker_id, "New Job")).into(),
+                );
             }
 
-            (file_id, file) = match rx.recv().unwrap() {
+            (file_id, file) = match self.rx.recv()? {
                 SchedulerResponse::NewJob(file_id, file) => (file_id, file),
                 SchedulerResponse::Respond(_) => {
                     return Err(LexError::from(BadResponseError).into());
@@ -114,7 +154,7 @@ impl Stage for Lexer {
     fn handle_request(rq: Self::Request, ctx: &mut Self::Context) -> Self::Response {
         let mut split = rq.name.split("::").peekable();
         let mut path: PathBuf;
-        let modules = ctx.modules.read().unwrap();
+        let modules = ctx.parts_list.read().unwrap();
         if split.next_if_eq(&"base").is_some() {
             path = PathBuf::new();
         } else {
@@ -135,7 +175,7 @@ impl Stage for Lexer {
 
         let id = File::open(path.with_added_extension("cfuq"));
         if let Ok(file) = id {
-            let mut modules = ctx.modules.write().unwrap();
+            let mut modules = ctx.parts_list.write().unwrap();
             for (i, tu) in modules[old_len..].iter().enumerate() {
                 if tu.0 == path {
                     return Ok(old_len + i);
@@ -155,7 +195,7 @@ impl Stage for Lexer {
 
     fn new_job(ctx: &mut Self::Context) -> Result<Option<Self::Job>, SchedulerError> {
         let mut job_queue = ctx.job_queue.lock()?;
-        let mut modules = ctx.modules.write()?;
+        let mut modules = ctx.parts_list.write()?;
         if job_queue.is_empty() {
             Ok(None)
         } else {
@@ -173,7 +213,7 @@ impl Stage for Lexer {
     }
 
     fn commit_work(result: Self::Result, ctx: &mut Self::Context) -> Result<(), SchedulerError> {
-        let mut modules = ctx.modules.write().unwrap();
+        let mut modules = ctx.parts_list.write()?;
         modules[result.file_id]
             .1
             .finish_processing(PartState::Tokens(result))?;
@@ -181,139 +221,123 @@ impl Stage for Lexer {
     }
 }
 
+impl From<&mut Lexer> for LexResult {
+    fn from(value: &mut Lexer) -> Self {
+        Self {
+            file_id: value.file_id,
+            tokens: mem::take(&mut value.tokens),
+            const_macros: mem::take(&mut value.const_macros),
+            macro_funcs: mem::take(&mut value.macro_funcs),
+            modules: Vec::new(),
+            errors: mem::take(&mut value.errors),
+        }
+    }
+}
+
 impl Lexer {
-    fn lex_file(
-        worker_id: usize,
-        file_id: usize,
-        file: File,
-        tx: &Sender<(usize, WorkerRequest<Lexer>)>,
-    ) -> (usize, Result<LexResult, LexError>) {
-        let mut outstanding_module_requests: usize = 0;
-        let mut tokens: Vec<Token> = Vec::new();
-        let mut const_macros: Vec<ConstMacro> = Vec::new();
-        let mut macro_funcs: Vec<MacroFunc> = Vec::new();
-        let mut errors: Vec<LexError> = Vec::new();
-        let mut pos = Position::new(file_id);
-        let mut rd = BufReader::new(file);
+    fn lex_file(&mut self, file_id: usize, file: File) -> Result<LexResult, LexError> {
+        self.outstanding_module_requests = 0;
+        self.tokens = Vec::new();
+        self.const_macros = Vec::new();
+        self.macro_funcs = Vec::new();
+        self.errors = Vec::new();
+        self.pos = Position::new(file_id);
+        self.rd = Some(BufReader::new(file));
         loop {
             let mut buff = String::new();
-            let count = match rd.read_line(&mut buff) {
+            let count = match self.rd.as_mut().unwrap().read_line(&mut buff) {
                 Ok(val) => val,
-                Err(err) => return (outstanding_module_requests, Err(err.into())),
+                Err(err) => return Err(err.into()),
             };
             if count == 0 {
                 break;
             }
             let mut tmp = &buff[..];
             let (bytes, graphemes) = Lexer::strip_start(&mut tmp);
-            pos.column_bytes += bytes;
-            pos.column_graphemes += graphemes;
+            self.pos.column_bytes += bytes;
+            self.pos.column_graphemes += graphemes;
             tmp = tmp.trim_end();
             if tmp.is_empty() || tmp.starts_with('#') {
                 if tmp.starts_with("#!") {
-                    if let Some(tmp) = tmp.strip_prefix("#!def ") {
-                        if buff.contains('(') {
-                            if let Err(err) = Lexer::handle_macro_funcs(
-                                &mut macro_funcs,
-                                &mut errors,
-                                &mut rd,
-                                tmp,
-                                &mut pos,
-                            ) {
-                                errors.push(err.into());
-                            }
-                        } else {
-                            Lexer::handle_const_macros(
-                                &mut const_macros,
-                                &mut errors,
-                                &buff,
-                                &mut pos,
-                            );
+                    match self.handle_directives(&mut tmp) {
+                        Err(LexError::FailedRequest(err)) => {
+                            return Err(err.into());
                         }
-                    } else if tmp.starts_with("#!also ") {
-                        tmp = tmp[7..].trim();
-                        if tx
-                            .send((
-                                worker_id,
-                                WorkerRequest::Request(ModIdRequest {
-                                    parent_id: file_id,
-                                    name: tmp.to_string(),
-                                    pos,
-                                }),
-                            ))
-                            .is_err()
-                        {
-                            return (
-                                outstanding_module_requests,
-                                Err(FailedRequestError::new(worker_id, "ModID Request").into()),
-                            );
-                        }
-                        outstanding_module_requests += 1;
-                    } else {
-                        let result = Lexer::tokenize(tmp, &mut pos).0;
-                        match result {
-                            Ok(val) => tokens.push(val),
-                            Err(err) => errors.push(err),
-                        }
+                        Err(err) => self.errors.push(err),
+                        Ok(()) => (),
                     }
                 }
-                pos.column_bytes = 1;
-                pos.column_graphemes = 1;
-                pos.line += 1;
+                self.pos.column_bytes = 1;
+                self.pos.column_graphemes = 1;
+                self.pos.line += 1;
                 continue;
             }
             loop {
-                let (tkn, rest) = Lexer::peel_token(tmp, &mut pos);
+                let (tkn, rest) = self.peel_token(tmp);
                 match tkn {
-                    Ok(tkn) => {
-                        tokens.push(tkn);
-                        tmp = match rest {
-                            Some(tail) => tail,
-                            None => break,
-                        };
-                    }
-                    Err(err) => {
-                        errors.push(err);
-                        tmp = match rest {
-                            Some(tail) => tail,
-                            None => break,
-                        }
-                    }
+                    Ok(tkn) => self.tokens.push(tkn),
+                    Err(err) => self.errors.push(err),
                 }
+                tmp = match rest {
+                    Some(tail) => tail,
+                    None => break,
+                };
             }
-            tokens.push(tokens::Token {
+            self.tokens.push(tokens::Token {
                 kind: tokens::TokenKind::Delim(DelimKind::EndL),
-                prov: pos.as_provenance(1),
+                prov: self.pos.as_provenance(1),
             });
-            pos.column_bytes = 1;
-            pos.column_graphemes = 1;
-            pos.line += 1;
+            self.pos.column_bytes = 1;
+            self.pos.column_graphemes = 1;
+            self.pos.line += 1;
         }
-        (
-            outstanding_module_requests,
-            Ok(LexResult {
-                file_id,
-                tokens,
-                const_macros,
-                macro_funcs,
-                modules: Vec::new(),
-                errors,
-            }),
-        )
+
+        Ok(self.into())
     }
 
-    fn handle_macro_funcs(
-        macro_funcs: &mut Vec<MacroFunc>,
-        errors: &mut Vec<LexError>,
-        rd: &mut BufReader<File>,
-        buff: &str,
-        pos: &mut Position,
-    ) -> Result<(), std::io::Error> {
-        let mut buff = buff[6..].trim_start();
+    fn handle_directives(&mut self, tmp: &mut &str) -> Result<(), LexError> {
+        if let Some(postfix) = tmp.strip_prefix("#!def ") {
+            *tmp = postfix;
+            if tmp.contains('(') {
+                if let Err(err) = self.handle_macro_funcs(tmp) {
+                    self.errors.push(err.into());
+                }
+            } else {
+                self.handle_const_macros(tmp);
+            }
+        } else if let Some(postfix) = tmp.strip_prefix("#!also ") {
+            self.outstanding_module_requests += 1;
+            *tmp = postfix;
+            if self
+                .tx
+                .send((
+                    self.worker_id,
+                    WorkerRequest::Request(ModIdRequest {
+                        parent_id: self.file_id,
+                        name: tmp.to_string(),
+                        pos: self.pos,
+                    }),
+                ))
+                .is_err()
+            {
+                return Err(FailedRequestError::new(self.worker_id, "ModID Request").into());
+            }
+            return Ok(());
+        } else {
+            let result = self.tokenize(tmp).0;
+            match result {
+                Ok(val) => self.tokens.push(val),
+                Err(err) => self.errors.push(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_macro_funcs(&mut self, buff: &mut &str) -> Result<(), std::io::Error> {
         let mut sig_tokens = Vec::new();
         let mut def_tokens = Vec::new();
         loop {
-            let (result, tail) = Lexer::peel_token(buff, &mut *pos);
+            let (result, tail) = self.peel_token(buff);
 
             match result {
                 Ok(val) => {
@@ -322,17 +346,17 @@ impl Lexer {
                     }
                     sig_tokens.push(val);
                 }
-                Err(err) => errors.push(err),
+                Err(err) => self.errors.push(err),
             }
 
             if let Some(tail) = tail {
-                buff = tail;
+                *buff = tail;
             } else {
                 let gcount = buff.graphemes(true).count();
-                errors.push(
+                self.errors.push(
                     NoMacroDefError {
                         bad: buff.to_string(),
-                        prov: pos.as_provenance(gcount),
+                        prov: self.pos.as_provenance(gcount),
                     }
                     .into(),
                 );
@@ -346,21 +370,21 @@ impl Lexer {
             while depth > 0 {
                 while tail.is_empty() {
                     buff.clear();
-                    if rd.read_line(&mut buff)? == 0 {
-                        errors.push(
+                    if self.rd.as_mut().unwrap().read_line(&mut buff)? == 0 {
+                        self.errors.push(
                             UnclosedMacroError {
-                                prov: pos.as_provenance(1),
+                                prov: self.pos.as_provenance(1),
                             }
                             .into(),
                         );
                         return Ok(());
                     }
                     tail = &buff[..];
-                    pos.column_bytes = 1;
-                    pos.column_graphemes = 1;
-                    pos.line += 1;
+                    self.pos.column_bytes = 1;
+                    self.pos.column_graphemes = 1;
+                    self.pos.line += 1;
                 }
-                let (result, tail_maybe) = Lexer::peel_token(tail, &mut *pos);
+                let (result, tail_maybe) = self.peel_token(tail);
                 match result {
                     Ok(val) => {
                         if val.kind == TokenKind::Delim(DelimKind::BlockO) {
@@ -370,7 +394,7 @@ impl Lexer {
                         }
                         def_tokens.push(val);
                     }
-                    Err(err) => errors.push(err),
+                    Err(err) => self.errors.push(err),
                 }
 
                 if let Some(tail_maybe) = tail_maybe {
@@ -379,36 +403,32 @@ impl Lexer {
                     tail = "";
                 }
             }
-            macro_funcs.push(MacroFunc::Tokens(sig_tokens, def_tokens));
+            self.macro_funcs
+                .push(MacroFunc::Tokens(sig_tokens, def_tokens));
             return Ok(());
         }
         let gcount = buff.graphemes(true).count();
-        errors.push(
+        self.errors.push(
             NoMacroDefError {
                 bad: buff.to_string(),
-                prov: pos.as_provenance(gcount),
+                prov: self.pos.as_provenance(gcount),
             }
             .into(),
         );
         Ok(())
     }
 
-    fn handle_const_macros(
-        const_macros: &mut Vec<ConstMacro>,
-        errors: &mut Vec<LexError>,
-        buff: &str,
-        pos: &mut Position,
-    ) {
-        let mut tmp = String::from(buff[6..].trim_start());
+    fn handle_const_macros(&mut self, tmp: &str) {
         let idx = tmp.find(|c: char| c.is_whitespace());
         if let Some(val) = idx {
+            let mut tmp = tmp.to_string();
             let tail = tmp.split_off(val);
             if tail.is_empty() {
                 let gcount = tmp.graphemes(true).count();
-                errors.push(
+                self.errors.push(
                     NoMacroDefError {
                         bad: tmp,
-                        prov: pos.as_provenance(gcount),
+                        prov: self.pos.as_provenance(gcount),
                     }
                     .into(),
                 );
@@ -416,24 +436,24 @@ impl Lexer {
                 let mut tokens = Vec::new();
                 let mut tail = &tail[..];
                 loop {
-                    let (token, maybe_tail) = Lexer::peel_token(tail, pos);
+                    let (token, maybe_tail) = self.peel_token(tail);
                     match token {
                         Ok(token) => tokens.push(token),
-                        Err(err) => errors.push(err),
+                        Err(err) => self.errors.push(err),
                     }
                     let Some(new_tail) = maybe_tail else {
                         break;
                     };
                     tail = new_tail;
                 }
-                const_macros.push(ConstMacro::Tokens(tmp, tokens));
+                self.const_macros.push(ConstMacro::Tokens(tmp, tokens));
             }
         } else {
             let gcount = tmp.graphemes(true).count();
-            errors.push(
+            self.errors.push(
                 NoMacroDefError {
-                    bad: tmp,
-                    prov: pos.as_provenance(gcount),
+                    bad: tmp.to_string(),
+                    prov: self.pos.as_provenance(gcount),
                 }
                 .into(),
             );
@@ -441,14 +461,14 @@ impl Lexer {
     }
 
     fn peel_token<'a>(
+        &mut self,
         string: &'a str,
-        pos: &mut Position,
     ) -> (Result<tokens::Token, LexError>, Option<&'a str>) {
         let mut string = string;
         let (bytes, graphemes) = Lexer::strip_start(&mut string);
-        pos.column_bytes += bytes;
-        pos.column_graphemes += graphemes;
-        let (lit, consumed) = Lexer::parse_literal(string, &mut *pos);
+        self.pos.column_bytes += bytes;
+        self.pos.column_graphemes += graphemes;
+        let (lit, consumed) = self.parse_literal(string);
         let lit = match lit {
             Ok(val) => val,
             Err(err) => {
@@ -464,86 +484,96 @@ impl Lexer {
         for (i, c) in bytes.iter().enumerate() {
             match c {
                 b' ' | b'\t' => {
-                    let (token, _) = Lexer::tokenize(&string[0..i], &mut *pos);
+                    let (token, _) = self.tokenize(&string[0..i]);
                     return (token, Some(&string[i..]));
                 }
                 _ if Lexer::is_opdelim(*c) => {
                     if i == 0 {
-                        for (txt, tkn) in DELIMS {
-                            if *c == txt.as_bytes()[0] {
-                                let token = Token::new(Delim(*tkn), pos.as_provenance(1));
+                        for (idx, (txt, tkn)) in DELIMS.iter().enumerate() {
+                            if idx < MULTI_DELIMS {
+                                if bytes.len() < 2 {
+                                    continue;
+                                }
+                                if &bytes[..2] == txt.as_bytes() {
+                                    let tail = &string[2..];
+                                    let token = Token::new(Delim(*tkn), self.pos.as_provenance(2));
+                                    self.pos.column_bytes += 2;
+                                    self.pos.column_graphemes += 2;
+                                    return (Ok(token), (!tail.is_empty()).then_some(tail));
+                                }
+                            } else if *c == txt.as_bytes()[0] {
+                                let token = Token::new(Delim(*tkn), self.pos.as_provenance(1));
                                 let tail = &string[1..];
-                                pos.column_bytes += 1;
-                                pos.column_graphemes += 1;
+                                self.pos.column_bytes += 1;
+                                self.pos.column_graphemes += 1;
                                 return (Ok(token), (!tail.is_empty()).then_some(tail));
                             }
                         }
                         for (idx, (txt, tkn)) in OPS.iter().enumerate() {
-                            if idx < SINGLE_OPS {
-                                if &bytes[..1] == txt.as_bytes() {
-                                    let token = Token::new(Operator(*tkn), pos.as_provenance(1));
-                                    let tail = &string[1..];
-                                    pos.column_bytes += 1;
-                                    pos.column_graphemes += 1;
-                                    return (Ok(token), (!tail.is_empty()).then_some(tail));
-                                }
-                            } else {
+                            if idx < MULTI_OPS {
                                 if bytes.len() < 2 {
-                                    break;
+                                    continue;
                                 }
                                 if &bytes[..2] == txt.as_bytes() {
                                     let tail = &string[2..];
-                                    let token = Token::new(Operator(*tkn), pos.as_provenance(2));
-                                    pos.column_bytes += 2;
-                                    pos.column_graphemes += 2;
+                                    let token =
+                                        Token::new(Operator(*tkn), self.pos.as_provenance(2));
+                                    self.pos.column_bytes += 2;
+                                    self.pos.column_graphemes += 2;
                                     return (Ok(token), (!tail.is_empty()).then_some(tail));
                                 }
+                            } else if &bytes[..1] == txt.as_bytes() {
+                                let token = Token::new(Operator(*tkn), self.pos.as_provenance(1));
+                                let tail = &string[1..];
+                                self.pos.column_bytes += 1;
+                                self.pos.column_graphemes += 1;
+                                return (Ok(token), (!tail.is_empty()).then_some(tail));
                             }
                         }
                         let err = Err(BadOperatorError {
                             bad: String::from(&string[..1]),
-                            prov: pos.as_provenance(1),
+                            prov: self.pos.as_provenance(1),
                         }
                         .into());
-                        pos.column_bytes += 1;
-                        pos.column_graphemes += 1;
+                        self.pos.column_bytes += 1;
+                        self.pos.column_graphemes += 1;
                         let tail = &string[1..];
                         return (err, (!tail.is_empty()).then_some(tail));
                     }
-                    let (token, size) = Lexer::tokenize(&string[0..i], &mut *pos);
+                    let (token, size) = self.tokenize(&string[0..i]);
                     let tail = &string[size..];
                     return (token, (!tail.is_empty()).then_some(tail));
                 }
                 _ => (),
             }
         }
-        let (token, size) = Lexer::tokenize(string, &mut *pos);
-        pos.column_bytes += size;
-        pos.column_graphemes += string.graphemes(true).count();
+        let (token, size) = self.tokenize(string);
+        self.pos.column_bytes += size;
+        self.pos.column_graphemes += string.graphemes(true).count();
         (token, None)
     }
 
-    fn tokenize(string: &str, pos: &mut Position) -> (Result<tokens::Token, LexError>, usize) {
+    fn tokenize(&mut self, string: &str) -> (Result<tokens::Token, LexError>, usize) {
         if let Some(string) = string.strip_prefix('$') {
             let gcount = string.graphemes(true).count();
             let result = (
                 Ok(Token::new(
                     MacroInv(ModuleScopedId::Unresolved(string.to_string())),
-                    pos.as_provenance(gcount),
+                    self.pos.as_provenance(gcount),
                 )),
                 string.len(),
             );
-            pos.column_bytes += string.len();
-            pos.column_graphemes += gcount;
+            self.pos.column_bytes += string.len();
+            self.pos.column_graphemes += gcount;
             return result;
         }
         if let Some(string) = string.strip_prefix("#!") {
             for (spelling, kind) in DIRECTIVES {
                 if string.starts_with(*spelling) {
                     let gcount = string.graphemes(true).count();
-                    let result = Ok(Token::new(Directive(*kind), pos.as_provenance(gcount)));
-                    pos.column_bytes += string.len();
-                    pos.column_graphemes += gcount;
+                    let result = Ok(Token::new(Directive(*kind), self.pos.as_provenance(gcount)));
+                    self.pos.column_bytes += string.len();
+                    self.pos.column_graphemes += gcount;
                     return (result, string.len());
                 }
             }
@@ -555,42 +585,47 @@ impl Lexer {
                 .count();
             let err = Err(BadDirectiveError {
                 bad: string.to_string(),
-                prov: pos.as_provenance(gcount),
+                prov: self.pos.as_provenance(gcount),
             }
             .into());
-            pos.column_bytes += string.len();
-            pos.column_graphemes += gcount;
+            self.pos.column_bytes += string.len();
+            self.pos.column_graphemes += gcount;
             return (err, string.len());
         }
         for (spelling, kind) in KEYWORDS {
             if *spelling == string {
                 let result = (
-                    Ok(Token::new(Keyword(*kind), pos.as_provenance(string.len()))),
+                    Ok(Token::new(
+                        Keyword(*kind),
+                        self.pos.as_provenance(string.len()),
+                    )),
                     string.len(),
                 );
-                pos.column_bytes += string.len();
-                pos.column_graphemes += string.len();
+                self.pos.column_bytes += string.len();
+                self.pos.column_graphemes += string.len();
                 return result;
             }
         }
 
-        if string.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        if string.starts_with(|c: char| c.is_alphabetic())
+            && string.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
             let gcount = string.graphemes(true).count();
             let result = Ok(Token::new(
                 tokens::TokenKind::Identifier(ModuleScopedId::Unresolved(string.to_string())),
-                pos.as_provenance(gcount),
+                self.pos.as_provenance(gcount),
             ));
-            pos.column_bytes += string.len();
-            pos.column_graphemes += gcount;
+            self.pos.column_bytes += string.len();
+            self.pos.column_graphemes += gcount;
             return (result, string.len());
         }
         let gcount = string.graphemes(true).count();
         let err = BadIdentifierError {
             bad: string.to_string(),
-            prov: pos.as_provenance(gcount),
+            prov: self.pos.as_provenance(gcount),
         };
-        pos.column_bytes += string.len();
-        pos.column_graphemes += gcount;
+        self.pos.column_bytes += string.len();
+        self.pos.column_graphemes += gcount;
         (Err(err.into()), string.len())
     }
 
@@ -638,163 +673,129 @@ impl Lexer {
     /// None found `Ok(None)`, and a parse error `Err(BadLiteralError)`
     ///
     /// The second represents the amount of bytes to consume, 0 if no literal was found
-    fn parse_literal(
-        string: &str,
-        pos: &mut Position,
-    ) -> (Result<Option<Token>, BadLiteralError>, usize) {
-        let (res, num) = Lexer::parse_byte(string, pos);
+    fn parse_literal(&mut self, string: &str) -> (Result<Option<Token>, BadLiteralError>, usize) {
+        let (res, num) = self.parse_byte(string);
         match res {
             Ok(None) => (),
             value => return (value, num),
         }
 
-        let (res, num) = Lexer::parse_chars(string, pos);
+        let (res, num) = self.parse_char(string);
         match res {
             Ok(None) => (),
             value => return (value, num),
         }
 
-        let (res, num) = Lexer::parse_string(string, pos);
+        let (res, num) = self.parse_string(string);
         match res {
             Ok(None) => (),
             value => return (value, num),
         }
-        Lexer::parse_number(string, pos)
+        self.parse_number(string)
     }
 
-    fn parse_byte(
-        string: &str,
-        pos: &mut Position,
-    ) -> (Result<Option<Token>, BadLiteralError>, usize) {
-        if let Some(postfix) = string.strip_prefix("h'") {
-            if string.len() < 4 {
-                let err = Err(BadLiteralError {
-                    bad: String::from(string),
-                    prov: pos.as_provenance(string.len()),
-                });
-                pos.column_bytes += string.len();
-                pos.column_graphemes += string.graphemes(true).count();
-                return (err, string.len());
-            }
-            if !postfix.as_bytes()[..2].is_ascii() {
-                let mut it = string.graphemes(true);
-                let offense;
-                unsafe {
-                    offense = string[..2].to_string()
-                        + it.next().unwrap_unchecked()
-                        + it.next().unwrap_or_default();
-                }
-                let gcount = offense.graphemes(true).count();
-                let bcount = offense.len();
-                let err = Err(BadLiteralError {
-                    bad: offense,
-                    prov: pos.as_provenance(gcount),
-                });
-                pos.column_bytes += bcount;
-                pos.column_graphemes += gcount;
-                return (err, bcount);
-            }
-            let h = u8::from_str_radix(&postfix[..2], 16).map_err(|_| BadLiteralError {
-                bad: String::from(&string[..4]),
-                prov: pos.as_provenance(4),
-            });
-            let h = match h {
-                Ok(val) => val,
-                Err(err) => {
-                    pos.column_bytes += 4;
-                    pos.column_graphemes += 4;
-                    return (Err(err), 4);
-                }
-            };
-            let t = Token::new(Literal(LiteralKind::Byte(h)), pos.as_provenance(4));
-            pos.column_bytes += 4;
-            pos.column_graphemes += 4;
-            return (Ok(Some(t)), 4);
-        }
-        (Ok(None), 0)
-    }
+    fn parse_byte(&mut self, str: &str) -> (Result<Option<Token>, BadLiteralError>, usize) {
+        if let Some(str) = str.strip_prefix("h'") {
+            for (i, c) in str.as_bytes().iter().enumerate() {
+                if c.is_ascii_whitespace() || Lexer::is_opdelim(*c) {
+                    let slice = &str[..i];
+                    if slice.chars().any(|c: char| !c.is_ascii_hexdigit()) {
+                        let gcount = slice.graphemes(true).count();
+                        let err = Err(BadLiteralError {
+                            bad: slice.to_string(),
+                            prov: self.pos.as_provenance(gcount),
+                        });
+                        self.pos.column_bytes += i + 2;
+                        self.pos.column_graphemes += gcount + 2;
+                        return (err, i + 2);
+                    }
+                    let result = Ok(Some(Token::new(
+                        Literal(LiteralKind::Byte(slice.to_ascii_lowercase())),
+                        self.pos.as_provenance(i + 2),
+                    )));
 
-    fn parse_chars(
-        string: &str,
-        pos: &mut Position,
-    ) -> (Result<Option<Token>, BadLiteralError>, usize) {
-        if let Some(postfix) = string.strip_prefix("b'") {
-            if string.len() < 3 {
-                let err = Err(BadLiteralError {
-                    bad: String::from(string),
-                    prov: pos.as_provenance(string.len()),
-                });
-                pos.column_bytes += string.len();
-                pos.column_graphemes += string.len();
-                return (err, string.len());
+                    self.pos.column_bytes += i + 2;
+                    self.pos.column_graphemes += i + 2;
+                    return (result, i + 2);
+                }
             }
-            if string.as_bytes()[..3].is_ascii() {
-                let ch: u8 = string.as_bytes()[2];
+        } else if let Some(postfix) = str.strip_prefix("b'") {
+            if str.len() < 3 {
+                let err = Err(BadLiteralError {
+                    bad: String::from(str),
+                    prov: self.pos.as_provenance(str.len()),
+                });
+                self.pos.column_bytes += str.len();
+                self.pos.column_graphemes += str.len();
+                return (err, str.len());
+            }
+            if str.as_bytes()[..3].is_ascii() {
+                let ch = format!("{:02x}", str.as_bytes()[2]);
                 let result = (
                     Ok(Some(Token::new(
                         Literal(LiteralKind::Byte(ch)),
-                        pos.as_provenance(3),
+                        self.pos.as_provenance(3),
                     ))),
                     3,
                 );
-                pos.column_bytes += 3;
-                pos.column_graphemes += 3;
+                self.pos.column_bytes += 3;
+                self.pos.column_graphemes += 3;
                 return result;
             }
             let ch = postfix.graphemes(true).next().unwrap_or_default();
             let err = Err(BadLiteralError {
-                bad: String::from(&string[..2]) + ch,
-                prov: pos.as_provenance(3),
+                bad: String::from(&str[..2]) + ch,
+                prov: self.pos.as_provenance(3),
             });
-            pos.column_bytes += 2 + ch.len();
-            pos.column_graphemes += 3;
+            self.pos.column_bytes += 2 + ch.len();
+            self.pos.column_graphemes += 3;
             return (err, 2 + ch.len());
         }
+        (Ok(None), 0)
+    }
 
+    fn parse_char(&mut self, string: &str) -> (Result<Option<Token>, BadLiteralError>, usize) {
         if let Some(postfix) = string.strip_prefix('\'') {
             if string.len() < 2 {
                 let err = Err(BadLiteralError {
                     bad: String::from(string),
-                    prov: pos.as_provenance(string.len()),
+                    prov: self.pos.as_provenance(string.len()),
                 });
-                pos.column_bytes += string.len();
-                pos.column_graphemes += string.len();
+                self.pos.column_bytes += string.len();
+                self.pos.column_graphemes += string.len();
                 return (err, string.len());
             }
             if postfix[..1].is_ascii() {
                 let ch: u8 = string.as_bytes()[1];
                 let result = Ok(Some(Token::new(
                     Literal(LiteralKind::Char(ch)),
-                    pos.as_provenance(2),
+                    self.pos.as_provenance(2),
                 )));
-                pos.column_bytes += 2;
-                pos.column_graphemes += 2;
+                self.pos.column_bytes += 2;
+                self.pos.column_graphemes += 2;
                 return (result, 2);
             }
             let ch = string[1..].graphemes(true).next().unwrap_or_default();
             let err = Err(BadLiteralError {
                 bad: String::from("'") + ch,
-                prov: pos.as_provenance(2),
+                prov: self.pos.as_provenance(2),
             });
-            pos.column_bytes += 1 + ch.len();
-            pos.column_graphemes += 2;
+            self.pos.column_bytes += 1 + ch.len();
+            self.pos.column_graphemes += 2;
             return (err, 1 + ch.len());
         }
         (Ok(None), 0)
     }
 
-    fn parse_string(
-        string: &str,
-        pos: &mut Position,
-    ) -> (Result<Option<Token>, BadLiteralError>, usize) {
+    fn parse_string(&mut self, string: &str) -> (Result<Option<Token>, BadLiteralError>, usize) {
         if let Some(postfix) = string.strip_prefix('"') {
             if string.len() < 2 {
                 let err = Err(BadLiteralError {
                     bad: String::from(string),
-                    prov: pos.as_provenance(string.len()),
+                    prov: self.pos.as_provenance(string.len()),
                 });
-                pos.column_bytes += string.len();
-                pos.column_graphemes += string.len();
+                self.pos.column_bytes += string.len();
+                self.pos.column_graphemes += string.len();
                 return (err, string.len());
             }
             let mut escaped = false;
@@ -806,10 +807,10 @@ impl Lexer {
                     let gcount = 2 + string[..i].graphemes(true).count();
                     let result = Ok(Some(Token::new(
                         Literal(LiteralKind::String(String::from(&string[..i]))),
-                        pos.as_provenance(gcount),
+                        self.pos.as_provenance(gcount),
                     )));
-                    pos.column_bytes += 2 + i;
-                    pos.column_graphemes += gcount;
+                    self.pos.column_bytes += 2 + i;
+                    self.pos.column_graphemes += gcount;
                     return (result, 2 + i);
                 } else {
                     escaped = false;
@@ -817,22 +818,19 @@ impl Lexer {
             }
             let err = Err(BadLiteralError {
                 bad: String::from('"') + string,
-                prov: pos.as_provenance(1 + string.len()),
+                prov: self.pos.as_provenance(1 + string.len()),
             });
-            pos.column_bytes += 1 + string.len();
-            pos.column_graphemes += 1 + string.graphemes(true).count();
+            self.pos.column_bytes += 1 + string.len();
+            self.pos.column_graphemes += 1 + string.graphemes(true).count();
             return (err, 1 + string.len());
         }
         (Ok(None), 0)
     }
 
-    fn parse_number(
-        string: &str,
-        pos: &mut Position,
-    ) -> (Result<Option<Token>, BadLiteralError>, usize) {
-        if string.starts_with(|c: char| c.is_ascii_digit()) {
+    fn parse_number(&mut self, str: &str) -> (Result<Option<Token>, BadLiteralError>, usize) {
+        if str.starts_with(|c: char| c.is_ascii_digit()) {
             let mut is_float = false;
-            for (i, c) in string.as_bytes().iter().enumerate() {
+            for (i, c) in str.as_bytes().iter().enumerate() {
                 if !c.is_ascii_digit() {
                     if *c == b'.' {
                         is_float = true;
@@ -842,78 +840,81 @@ impl Lexer {
                         continue;
                     }
                     if is_float {
-                        let num = string[..i].parse::<f64>().map_err(|_| BadLiteralError {
-                            bad: String::from(&string[..i]),
-                            prov: pos.as_provenance(i),
+                        let num = str[..i].parse::<f64>().map_err(|_| BadLiteralError {
+                            bad: String::from(&str[..i]),
+                            prov: self.pos.as_provenance(i),
                         });
                         let result = match num {
                             Ok(val) => val,
                             Err(e) => {
-                                pos.column_bytes += i;
-                                pos.column_graphemes += string[..i].graphemes(true).count();
+                                self.pos.column_bytes += i;
+                                self.pos.column_graphemes += str[..i].graphemes(true).count();
                                 return (Err(e), i);
                             }
                         };
 
                         let result = Ok(Some(Token::new(
                             Literal(LiteralKind::Float(result)),
-                            pos.as_provenance(i),
+                            self.pos.as_provenance(i),
                         )));
-                        pos.column_bytes += i;
-                        pos.column_graphemes += string[..i].graphemes(true).count();
+                        self.pos.column_bytes += i;
+                        self.pos.column_graphemes += str[..i].graphemes(true).count();
                         return (result, i);
                     }
-                    let num = string[..i].parse::<i64>().map_err(|_| BadLiteralError {
-                        bad: String::from(&string[..i]),
-                        prov: pos.as_provenance(i),
-                    });
-                    let num = match num {
-                        Ok(val) => val,
-                        Err(e) => {
-                            pos.column_bytes += i;
-                            pos.column_graphemes += string[..i].graphemes(true).count();
-                            return (Err(e), i);
-                        }
-                    };
+                    let slice = &str[..i];
+                    if slice.chars().any(|c: char| !c.is_ascii_digit()) {
+                        let gcount = slice.graphemes(true).count();
+                        let err = Err(BadLiteralError {
+                            bad: slice.to_string(),
+                            prov: self.pos.as_provenance(gcount),
+                        });
+                        self.pos.column_bytes += i;
+                        self.pos.column_graphemes += gcount;
+                        return (err, i);
+                    }
                     let result = Ok(Some(Token::new(
-                        Literal(LiteralKind::Int(num)),
-                        pos.as_provenance(i),
+                        Literal(LiteralKind::Int(slice.to_string())),
+                        self.pos.as_provenance(i),
                     )));
-                    pos.column_bytes += i;
-                    pos.column_graphemes += string[..i].graphemes(true).count();
+
+                    self.pos.column_bytes += i;
+                    self.pos.column_graphemes += i;
                     return (result, i);
                 }
             }
             if is_float {
-                let num = string.parse::<f64>().map_err(|_| BadLiteralError {
-                    bad: String::from(string),
-                    prov: pos.as_provenance(string.graphemes(true).count()),
+                let num = str.parse::<f64>().map_err(|_| BadLiteralError {
+                    bad: String::from(str),
+                    prov: self.pos.as_provenance(str.graphemes(true).count()),
                 });
                 let num = match num {
                     Ok(val) => Ok(Some(Token::new(
                         Literal(LiteralKind::Float(val)),
-                        pos.as_provenance(string.graphemes(true).count()),
+                        self.pos.as_provenance(str.graphemes(true).count()),
                     ))),
                     Err(e) => Err(e),
                 };
-                pos.column_bytes += string.len();
-                pos.column_graphemes += string.graphemes(true).count();
-                return (num, string.len());
+                self.pos.column_bytes += str.len();
+                self.pos.column_graphemes += str.graphemes(true).count();
+                return (num, str.len());
             }
-            let num = string.parse::<i64>().map_err(|_| BadLiteralError {
-                bad: String::from(string),
-                prov: pos.as_provenance(string.graphemes(true).count()),
-            });
-            let num = match num {
-                Ok(val) => Ok(Some(Token::new(
-                    Literal(LiteralKind::Int(val)),
-                    pos.as_provenance(string.graphemes(true).count()),
-                ))),
-                Err(e) => Err(e),
-            };
-            pos.column_bytes += string.len();
-            pos.column_graphemes += string.graphemes(true).count();
-            return (num, string.len());
+            if str.chars().any(|c: char| !c.is_ascii_digit()) {
+                let gcount = str.graphemes(true).count();
+                let err = Err(BadLiteralError {
+                    bad: str.to_string(),
+                    prov: self.pos.as_provenance(gcount),
+                });
+                self.pos.column_bytes += str.len();
+                self.pos.column_graphemes += gcount;
+                return (err, str.len());
+            }
+            let result = Ok(Some(Token::new(
+                Literal(LiteralKind::Int(str.to_string())),
+                self.pos.as_provenance(str.len()),
+            )));
+            self.pos.column_bytes += str.len();
+            self.pos.column_graphemes += str.len();
+            return (result, str.len());
         }
         (Ok(None), 0)
     }

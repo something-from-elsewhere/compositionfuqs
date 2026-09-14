@@ -25,11 +25,11 @@ pub enum TokenKind {
 
 #[derive(Debug, PartialEq)]
 pub enum LiteralKind {
-    Int(i64),
+    Int(String),
     Float(f64),
     String(String),
     Char(u8),
-    Byte(u8),
+    Byte(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,13 +83,23 @@ pub enum DelimKind {
     Sep,
     EndL,
     TypeMarker,
+    SubPart,
 }
 
 #[allow(clippy::enum_glob_use)]
 use OperatorKind::*;
-pub const SINGLE_OPS: usize = 13;
+pub const MULTI_OPS: usize = 9;
 /// Single-byte operators are listed first, their count is stored in `SINGLE_OPS`
 pub const OPS: &[(&str, OperatorKind)] = &[
+    ("->", Project),
+    ("=>", Return),
+    ("//", DivUp),
+    ("&&", LogAnd),
+    ("||", LogOr),
+    ("==", Equal),
+    ("!=", NEqual),
+    (">=", MoreEqual),
+    ("<=", LessEqual),
     ("=", Assign),
     ("+", Add),
     ("-", Negate),
@@ -103,20 +113,14 @@ pub const OPS: &[(&str, OperatorKind)] = &[
     ("!", LogNot),
     ("<", Less),
     (">", More),
-    ("->", Project),
-    ("=>", Return),
-    ("//", DivUp),
-    ("&&", LogAnd),
-    ("||", LogOr),
-    ("==", Equal),
-    ("!=", NEqual),
-    (">=", MoreEqual),
-    ("<=", LessEqual),
 ];
 
 #[allow(clippy::enum_glob_use)]
 use DelimKind::*;
+pub const MULTI_DELIMS: usize = 1;
+/// Multi-byte delimiters are listed first, their count specified in `MULTI_DELIMS`
 pub const DELIMS: &[(&str, DelimKind)] = &[
+    ("::", SubPart),
     ("{", BlockO),
     ("}", BlockC),
     ("(", InvokeO),
@@ -130,7 +134,7 @@ pub const DELIMS: &[(&str, DelimKind)] = &[
 #[allow(clippy::enum_glob_use)]
 use KeywordKind::*;
 pub const KEYWORDS: &[(&str, KeywordKind)] =
-    &[("is ", TypeCheck), ("fu ", Function), ("thing ", Thing)];
+    &[("is", TypeCheck), ("fu", Function), ("thing", Thing)];
 
 #[allow(clippy::enum_glob_use)]
 use DirectiveKind::*;

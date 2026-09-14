@@ -13,7 +13,8 @@ mod tokens;
 
 fn main() {
     let mut compiler = Compiler::new();
-    let result = compiler.lex(Path::new("src/compfuqs/my.cfuq"), 8);
+    let result = compiler.lex(Path::new("src/compfuqs/my.cfuq"), 0);
+    dbg!(&*compiler.parts.read().unwrap());
     match result {
         Ok(()) => (),
         Err(e) => eprintln!("{}", compiler.display_error(&e)),
