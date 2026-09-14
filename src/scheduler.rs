@@ -144,7 +144,7 @@ impl<'a, S: Stage> Scheduler<'a, S> {
             let producer = producer.clone();
             workers.push(Worker {
                 state: WorkerState::Idle,
-                handle: thread::spawn(move || S::new().spin_up(idx, rx, producer)),
+                handle: thread::spawn(move || S::new(idx, rx, producer).spin_up()),
                 tx,
             });
         }
@@ -242,7 +242,7 @@ impl<'a, S: Stage> Scheduler<'a, S> {
                         worker,
                         Worker {
                             state: WorkerState::Idle,
-                            handle: thread::spawn(move || S::new().spin_up(i, rx, producer)),
+                            handle: thread::spawn(move || S::new(i, rx, producer).spin_up()),
                             tx,
                         },
                     );
