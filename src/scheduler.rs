@@ -108,7 +108,7 @@ pub struct FailedRequestError {
 
 #[derive(Debug)]
 pub struct ThreadPanicError {
-    thread_id: usize,
+    worker_id: usize,
     message: String,
 }
 
@@ -194,6 +194,30 @@ impl<'a, S: Stage> Scheduler<'a, S> {
                 }
             }
         }
+
+        // Change the world, my final message. Goodbyee...
+        for (i, worker) in mem::take(&mut self.workers).into_iter().enumerate() {
+            if worker.tx.send(SchedulerResponse::ShutDown).is_err() {
+                self.errors.push(
+                    SchedulerError::from(FailedResponseError {
+                        worker_id: i,
+                        msg_type: "Goodbye now",
+                    })
+                    .into(),
+                );
+            }
+            match worker.handle.join() {
+                Ok(Ok(())) => (),
+                Ok(Err(err)) => self.errors.push(err.into()),
+                Err(payload) => self.errors.push(
+                    SchedulerError::from(ThreadPanicError {
+                        worker_id: i,
+                        message: unwrap_panic(&payload).to_string(),
+                    })
+                    .into(),
+                ),
+            }
+        }
     }
 
     /// # Returns
@@ -250,7 +274,7 @@ impl<'a, S: Stage> Scheduler<'a, S> {
                         Err(error) => {
                             self.errors.push(
                                 SchedulerError::from(ThreadPanicError {
-                                    thread_id: i,
+                                    worker_id: i,
                                     message: unwrap_panic(&error).to_string(),
                                 })
                                 .into(),
@@ -362,7 +386,7 @@ impl From<WrongStageError> for SchedulerError {
 
 impl fmt::Display for ThreadPanicError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id = self.thread_id;
+        let id = self.worker_id;
         let msg = self.message.as_str();
         write!(f, "Worker {id} panicked with message \"{msg}\"!")
     }
